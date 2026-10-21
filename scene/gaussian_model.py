@@ -30,24 +30,70 @@ except:
 class GaussianModel:
 
     def setup_functions(self):
+        """
+        Set up activation functions for scaling, covariance, opacity, and rotation.
+
+        This method initializes various activation functions used in the context of
+        scaling, covariance calculation, opacity, and rotation operations. The 
+        functions defined here are crucial for transforming and manipulating data 
+        in the specified mathematical contexts.
+
+        Activations initialized:
+        - `scaling_activation`: Exponential function for scaling.
+        - `scaling_inverse_activation`: Logarithmic function for inverse scaling.
+        - `covariance_activation`: Custom function to calculate covariance based 
+        on scaling and rotation.
+        - `opacity_activation`: Sigmoid function to manage opacity values.
+        - `inverse_opacity_activation`: Function to compute the inverse of the 
+        sigmoid for opacity.
+        - `rotation_activation`: Normalization function for rotation operations.
+        """
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+            """
+            Build a covariance matrix from scaling and rotation parameters.
+
+            Args:
+                scaling (Tensor): The scaling factor applied to the data.
+                scaling_modifier (float): A modifier to adjust the scaling.
+                rotation (Tensor): The rotation matrix or angles to be applied.
+
+            Returns:
+                Tensor: A symmetric covariance matrix derived from the 
+                scaling and rotation inputs.
+            """
+
+            # Build L matrix from modified scaling and rotation
+            # L will serve as a lower triangular matrix
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
             actual_covariance = L @ L.transpose(1, 2)
+            # Return symetric matrix
             symm = strip_symmetric(actual_covariance)
             return symm
         
-        self.scaling_activation = torch.exp
-        self.scaling_inverse_activation = torch.log
+
+        # Assigning activation functions to class attributes
+        self.scaling_activation = torch.exp                 # Exponential scaling for growth or magnification
+        self.scaling_inverse_activation = torch.log         # Logarithmic scaling for reduction or normalization
 
         self.covariance_activation = build_covariance_from_scaling_rotation
 
+        # Sigmoid function for mapping opacity values within a range of [0, 1]
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
 
+        # Normalization to ensure rotation values maintain unit norm, typically for vector rotations
         self.rotation_activation = torch.nn.functional.normalize
 
 
     def __init__(self, sh_degree, optimizer_type="default"):
+        """
+        Args:
+        sh_degree (int): Degree of the spherical harmonics (SH) representation.
+            This controls the level of detail in approximating the lighting 
+            and spatial representation using SH basis functions, with higher 
+            degrees capturing more detail. Typically, `sh_degree` ranges from 
+            0 (constant) to 3 or more for finer detail in 3D rendering.
+        """
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
@@ -57,8 +103,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
+        self.max_radii2D = torch.empty(0)           # Maximum radius values in 2D for Gaussian spread
+        self.xyz_gradient_accum = torch.empty(0)    # Accumulated gradients for `xyz` positions
         self.denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
@@ -82,6 +128,10 @@ class GaussianModel:
         )
     
     def restore(self, model_args, training_args):
+        """
+        Restore the state of the model from saved arguments, reinitializing model parameters 
+        and optimizer states for continued training or evaluation.
+        """
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -147,22 +197,55 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
-        self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        """
+        Initialize the model parameters from a given point cloud and camera information.
+
+        This method creates initial parameters for the 3D Gaussian splatting model using 
+        point cloud data and camera information. It sets up 3D positions, spherical 
+        harmonics features, scales, rotations, opacities, and exposure parameters, 
+        preparing them for training.
+
+        Args:
+            pcd (BasicPointCloud): A point cloud object containing 3D point positions 
+                (`pcd.points`) and color information (`pcd.colors`).
+            cam_infos (int): Camera information, which includes image names to map 
+                each camera's exposure settings. 
+            spatial_lr_scale (float): Learning rate scale factor applied to spatial 
+                parameters for controlled optimization.
+        Steps:
+        - Converts point cloud positions and colors to tensors and transfers them to GPU.
+        - Transforms RGB colors to spherical harmonics (SH) features.
+        - Initializes SH features, scale values, rotation quaternions, and opacity for each point.
+        - Maps camera information for exposure, setting initial exposure parameters as trainable tensors.
+        
+        Side Effects:
+            Prints the number of points initialized from the point cloud.
+        """
+        self.spatial_lr_scale = spatial_lr_scale    # Learning rate
+        # Converting variables from point cloud to a tensor & move to GPU
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()     
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+
+        # Initialize the feature tensor with zeroes and place on GPU
+        # Shape: [num_points, 3, (max_sh_degree + 1)^2]
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
+        # Calculate squared distances of each point from origin and clamp minimum to avoid zero distances
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        # Log-scale the distances for use as scaling factors, expanding for x, y, z axes
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        # Initialize rotations as identity quaternion (no rotation), [1, 0, 0, 0]
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
-        rots[:, 0] = 1
+        rots[:, 0] = 1      # Set w-component of quaternion to 1
 
+        # Initialize opacities with a base value, adjusted through inverse sigmoid activation
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        # Initializing variables as trainable parameters
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
